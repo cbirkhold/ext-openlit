@@ -1,9 +1,12 @@
 package hostmetrics
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -21,16 +24,17 @@ import (
 // following the OpenTelemetry semantic conventions for system metrics.
 // https://opentelemetry.io/docs/specs/semconv/system/system-metrics/
 type SystemCollector struct {
-	logger    *slog.Logger
-	fsExclude map[string]bool // filesystem types excluded from system.filesystem.*
-	reg       []metric.Registration
+	logger       *slog.Logger
+	fsExclude    map[string]bool // filesystem types excluded from system.filesystem.*
+	sysBlockPath string          // sysfs block-device root, overridable in tests
+	reg          []metric.Registration
 }
 
 // NewSystemCollector creates system-level metric instruments and registers callbacks.
 // fsTypesExclude lists filesystem types excluded from system.filesystem.*;
 // an empty list reports every mounted filesystem.
 func NewSystemCollector(provider *sdkmetric.MeterProvider, logger *slog.Logger, fsTypesExclude []string) (*SystemCollector, error) {
-	sc := &SystemCollector{logger: logger}
+	sc := &SystemCollector{logger: logger, sysBlockPath: "/sys/class/block"}
 	if len(fsTypesExclude) > 0 {
 		sc.fsExclude = make(map[string]bool, len(fsTypesExclude))
 		for _, t := range fsTypesExclude {
@@ -235,16 +239,36 @@ func (sc *SystemCollector) collectDisk(_ context.Context, o metric.Observer,
 			attribute.String("system.device", device),
 			attribute.String("disk.io.direction", "read"),
 		)
+
+		o.ObserveInt64(ioBytes, int64(stat.ReadBytes), readAttrs)
+		o.ObserveInt64(ops, int64(stat.ReadCount), readAttrs)
+
+		// Writes to a read-only block device are impossible, so its write
+		// counters are zero for as long as it stays read-only (e.g. loop
+		// devices backing snap images). Skip the constant-zero series; the
+		// check runs every cycle, so a device turning writable starts
+		// reporting on the next collection.
+		if sc.isReadOnlyDevice(device) {
+			continue
+		}
+
 		writeAttrs := metric.WithAttributes(
 			attribute.String("system.device", device),
 			attribute.String("disk.io.direction", "write"),
 		)
 
-		o.ObserveInt64(ioBytes, int64(stat.ReadBytes), readAttrs)
 		o.ObserveInt64(ioBytes, int64(stat.WriteBytes), writeAttrs)
-		o.ObserveInt64(ops, int64(stat.ReadCount), readAttrs)
 		o.ObserveInt64(ops, int64(stat.WriteCount), writeAttrs)
 	}
+}
+
+// isReadOnlyDevice reports whether a block device is read-only per its sysfs
+// ro flag. Device names from disk.IOCounters match the /sys/class/block
+// entries on Linux (sda1, nvme0n1p1, loop0, dm-0). On platforms or devices
+// without a sysfs entry the read fails and the device is treated as writable.
+func (sc *SystemCollector) isReadOnlyDevice(device string) bool {
+	ro, err := os.ReadFile(filepath.Join(sc.sysBlockPath, device, "ro"))
+	return err == nil && string(bytes.TrimSpace(ro)) == "1"
 }
 
 func (sc *SystemCollector) collectFilesystem(_ context.Context, o metric.Observer,
